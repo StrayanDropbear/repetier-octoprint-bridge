@@ -143,7 +143,7 @@ All configuration is environment variables.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `REPETIER_URL` | `http://127.0.0.1:3344` | Address of Repetier-Server |
+| `REPETIER_URL` | `http://192.168.0.50:3344` | Address of Repetier-Server |
 | `REPETIER_APIKEY` | — | Your Repetier API key |
 | `BRIDGE_KEYMAP` | `{}` | Maps slicer token → printer slug |
 | `REPETIER_SLUG` | — | Printer to use if the token isn't in the map |
