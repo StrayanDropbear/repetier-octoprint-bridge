@@ -1,0 +1,13 @@
+[Unit]
+Description=repetier-octoprint-bridge
+After=network-online.target
+
+[Service]
+User=repetier
+WorkingDirectory=/opt/repetier-octoprint-bridge
+EnvironmentFile=/opt/repetier-octoprint-bridge/.env
+ExecStart=/opt/repetier-octoprint-bridge/.venv/bin/uvicorn repetier_octoprint_bridge:app --host 0.0.0.0 --port 5000
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

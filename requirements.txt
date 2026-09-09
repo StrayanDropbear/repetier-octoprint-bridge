@@ -1,0 +1,8 @@
+# Pinned to the versions this was tested against. Starlette in particular is
+# pinned deliberately: its CORS handling of Private Network Access preflights
+# changed between releases, and that is what makes browser uploads work.
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.52.4
+httpx==0.28.1
+python-multipart==0.0.32
