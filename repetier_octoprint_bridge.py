@@ -129,7 +129,9 @@ class Gatekeeper:
     a browser client shows the real error rather than "connection failed".
     """
 
-    OPEN_PATHS = {"/"}  # liveness only; reveals nothing without a token
+    # Liveness only; reveals nothing without a token. Restricted by method too:
+    # an open POST / used to fall through to the catch-all, which buffers the body.
+    OPEN = {("/", "GET"), ("/", "HEAD")}
 
     def __init__(self, app):
         self.app = app
@@ -144,7 +146,7 @@ class Gatekeeper:
             scope = dict(scope)
             scope["headers"] = list(scope["headers"]) + [(b"x-api-key", key.encode("latin-1"))]
 
-        if scope["path"] not in self.OPEN_PATHS and scope["method"] != "OPTIONS":
+        if (scope["path"], scope["method"]) not in self.OPEN and scope["method"] != "OPTIONS":
             try:
                 check_key(key)
             except HTTPException:
@@ -707,7 +709,13 @@ async def root(x_api_key: Optional[str] = Header(None)):
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def catch_all(full_path: str, request: Request):
     """Log anything EasyPrint asks for that isn't implemented yet."""
-    body = (await request.body())[:500]
+    # Only what gets logged is read; the rest of the body is never buffered.
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) >= 500:
+            break
+    body = body[:500]
     safe_headers = {
         k: ("<redacted>" if k.lower() in REDACT_HEADERS else v)
         for k, v in request.headers.items()
