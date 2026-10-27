@@ -18,14 +18,16 @@ Selecting which printer:
     2. API key map   -> BRIDGE_KEYMAP='{"token-a":"Printer_One","token-b":"Printer_Two"}'
     3. REPETIER_SLUG -> single-printer fallback
 
-Everything unmatched under /api is logged with method, headers and body so you
-can see exactly what EasyPrint asks for and add it.
+Authenticated requests to paths that aren't implemented are logged with method,
+headers (token redacted) and body, so you can see what a client asks for and add
+it. Unauthenticated requests are rejected before their body is read.
 """
 
 import json
 import logging
 import os
 import re
+import secrets
 from datetime import datetime
 from typing import Optional
 
@@ -47,7 +49,24 @@ def env(name: str, default: str = "") -> str:
 REPETIER_URL = os.getenv("REPETIER_URL", "http://127.0.0.1:3344").rstrip("/")
 REPETIER_APIKEY = os.getenv("REPETIER_APIKEY", "")
 DEFAULT_SLUG = os.getenv("REPETIER_SLUG", "")
-KEY_MAP = json.loads(env("KEYMAP", "{}"))
+def load_keymap() -> dict:
+    raw = env("KEYMAP").strip() or "{}"  # a blank line in .env means "unset"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        hint = ""
+        if raw[:1] in ("'", '"'):
+            hint = (" It starts with a quote: if this came from a systemd "
+                    "EnvironmentFile, remove the quotes around the whole value.")
+        raise SystemExit(f"BRIDGE_KEYMAP is not valid JSON ({exc}).{hint}")
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        raise SystemExit('BRIDGE_KEYMAP must be a JSON object of "token": "printer_slug" strings')
+    return data
+
+
+KEY_MAP = load_keymap()
 REQUIRE_KEY = env("REQUIRE_KEY")  # if set, incoming key must match this or be in KEY_MAP
 LISTEN_HOST = env("HOST", "0.0.0.0")
 LISTEN_PORT = int(env("PORT", "5000"))
@@ -60,6 +79,14 @@ NAME_TEMPLATE = env("NAME_TEMPLATE", "{name}_{printer}_{material}_{nozzle}mm_{ti
 #   lower | upper | keep      ... or lower-all / upper-all for the whole filename.
 NAME_CASE = env("NAME_CASE", "lower").lower()
 
+# Reject oversized uploads before buffering them. A Pi's SD card and RAM are
+# the limit here, and the bridge may be reachable from outside the LAN.
+MAX_UPLOAD_MB = int(env("MAX_UPLOAD_MB", "512"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Never written to the log: the token travels in these on every request.
+REDACT_HEADERS = {"x-api-key", "authorization", "cookie", "proxy-authorization"}
+
 # What we claim to be. Some clients gate features on this.
 OCTO_VERSION = "1.9.3"
 API_VERSION = "0.1"
@@ -71,6 +98,84 @@ log = logging.getLogger("repetier-octoprint-bridge")
 
 app = FastAPI(title="repetier-octoprint-bridge")
 
+class BodyTooLarge(HTTPException):
+    def __init__(self):
+        super().__init__(413, f"Upload exceeds the {MAX_UPLOAD_MB} MB limit")
+
+
+def extract_key(scope) -> Optional[str]:
+    """The token from X-Api-Key, a Bearer header, or ?apikey= -- in that order."""
+    headers = {k.lower(): v for k, v in scope.get("headers", [])}
+    if b"x-api-key" in headers:
+        return headers[b"x-api-key"].decode("latin-1")
+    auth = headers.get(b"authorization", b"").decode("latin-1")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    from urllib.parse import parse_qs
+    qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+    return (qs.get("apikey") or [None])[0]
+
+
+class Gatekeeper:
+    """
+    Runs before anything reads the request body. FastAPI parses multipart
+    uploads *before* the endpoint function is called, so an auth check inside
+    the endpoint comes too late: an anonymous caller could still stream a file
+    to disk. This layer rejects unauthenticated requests on headers alone, and
+    counts body bytes as they arrive so a chunked upload with no Content-Length
+    can't get past the size limit either.
+
+    Sits inside CORSMiddleware so its 403/413 responses carry CORS headers and
+    a browser client shows the real error rather than "connection failed".
+    """
+
+    OPEN_PATHS = {"/"}  # liveness only; reveals nothing without a token
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        # Normalise the token into X-Api-Key so every handler reads one place.
+        key = extract_key(scope)
+        if key is not None and not any(k.lower() == b"x-api-key" for k, _ in scope["headers"]):
+            scope = dict(scope)
+            scope["headers"] = list(scope["headers"]) + [(b"x-api-key", key.encode("latin-1"))]
+
+        if scope["path"] not in self.OPEN_PATHS and scope["method"] != "OPTIONS":
+            try:
+                check_key(key)
+            except HTTPException:
+                return await JSONResponse({"detail": "Invalid API key"}, status_code=403)(scope, receive, send)
+
+        for k, v in scope["headers"]:
+            if k.lower() == b"content-length":
+                if v.isdigit() and int(v) > MAX_UPLOAD_BYTES:
+                    log.warning("rejected %s %s: %s bytes exceeds %d MB limit",
+                                scope["method"], scope["path"], v.decode(), MAX_UPLOAD_MB)
+                    return await JSONResponse(
+                        {"detail": f"Upload exceeds the {MAX_UPLOAD_MB} MB limit"},
+                        status_code=413,
+                    )(scope, receive, send)
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > MAX_UPLOAD_BYTES:
+                    log.warning("aborted %s %s: body passed %d MB limit mid-stream",
+                                scope["method"], scope["path"], MAX_UPLOAD_MB)
+                    raise BodyTooLarge()
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
 CORS_OPTS = dict(
     allow_origins=["*"],
     allow_methods=["*"],
@@ -78,6 +183,9 @@ CORS_OPTS = dict(
     expose_headers=["*"],
     max_age=3600,
 )
+# Order matters: middleware added later wraps the earlier ones. Gatekeeper goes
+# in first so CORS ends up outside it.
+app.add_middleware(Gatekeeper)
 try:
     # Starlette >= 0.41 rejects Private Network Access preflights unless this is
     # set. Older versions don't know the kwarg and allow them implicitly.
@@ -96,30 +204,13 @@ async def repetier_unreachable(request: Request, exc: httpx.RequestError):
 
 
 @app.middleware("http")
-async def normalize_and_log(request: Request, call_next):
-    """
-    1. We don't know yet whether EasyPrint sends the token as X-Api-Key, as
-       ?apikey=, or as a Bearer header -- accept all three and normalize to the
-       header the handlers read.
-    2. Chrome's Private Network Access preflight needs an explicit opt-in when a
-       public HTTPS page talks to a LAN address.
-    """
-    headers = dict(request.scope["headers"])
-    if b"x-api-key" not in headers:
-        key = request.query_params.get("apikey")
-        if not key:
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                key = auth[7:].strip()
-        if key:
-            request.scope["headers"] = request.scope["headers"] + [
-                (b"x-api-key", key.encode())
-            ]
-
+async def log_requests(request: Request, call_next):
+    """Outermost layer: log every request, including ones Gatekeeper rejects."""
     log.info("--> %s %s  origin=%s", request.method, request.url.path,
              request.headers.get("origin", "-"))
     response = await call_next(request)
     if request.method == "OPTIONS":
+        # Belt and braces for Starlette versions without allow_private_network.
         response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
 
@@ -175,7 +266,10 @@ def parse_gcode_meta(content: bytes) -> dict:
     if "time" in meta:
         meta["time"] = normalize_time(meta["time"])
     if "weight" in meta:
-        meta["weight"] = f"{float(meta['weight']):.0f}g"
+        try:
+            meta["weight"] = f"{float(meta['weight']):.0f}g"
+        except ValueError:  # "1.2.3" matches [\d.]+ but isn't a number
+            del meta["weight"]
     return meta
 
 
@@ -244,11 +338,29 @@ def build_filename(original: str, content: bytes, slug: str) -> str:
     return (name or stem) + ext
 
 
+SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
 def resolve_slug(path_slug: Optional[str], api_key: Optional[str]) -> str:
-    if path_slug:
-        return path_slug
+    """
+    A mapped token is BOUND to its printer: the /p/<slug> prefix cannot be used
+    to send a job to a different machine than the token was issued for. The
+    prefix is only honoured for a caller holding BRIDGE_REQUIRE_KEY, which is
+    the "any printer" credential.
+    """
     if api_key and api_key in KEY_MAP:
-        return KEY_MAP[api_key]
+        mapped = KEY_MAP[api_key]
+        if path_slug and path_slug != mapped:
+            raise HTTPException(403, "This token is not valid for that printer")
+        return mapped
+
+    if path_slug:
+        # Caller-supplied and interpolated into the Repetier URL -- keep it to
+        # a plain identifier.
+        if not SLUG_RE.match(path_slug):
+            raise HTTPException(400, "Invalid printer slug")
+        return path_slug
+
     if DEFAULT_SLUG:
         return DEFAULT_SLUG
     raise HTTPException(400, "No printer slug: use /p/<slug>, BRIDGE_KEYMAP or REPETIER_SLUG")
@@ -256,9 +368,16 @@ def resolve_slug(path_slug: Optional[str], api_key: Optional[str]) -> str:
 
 def check_key(api_key: Optional[str]) -> None:
     if not REQUIRE_KEY and not KEY_MAP:
-        return
-    if api_key and (api_key == REQUIRE_KEY or api_key in KEY_MAP):
-        return
+        return  # no auth configured -- warned about at startup
+    if api_key:
+        if api_key in KEY_MAP:
+            return
+        # Compare as bytes: compare_digest raises TypeError on non-ASCII str,
+        # which turned a junk header into a 500.
+        if REQUIRE_KEY and secrets.compare_digest(
+            api_key.encode("utf-8", "surrogateescape"), REQUIRE_KEY.encode("utf-8")
+        ):
+            return
     raise HTTPException(403, "Invalid API key")
 
 
@@ -485,8 +604,16 @@ async def upload_file(
             "Disable binary G-code in the print profile.",
         )
     content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Upload exceeds the {MAX_UPLOAD_MB} MB limit")
+
     original = name
     name = build_filename(original, content, slug)
+    # Applies even when renaming is switched off: the client controls this
+    # string and it ends up as a filename on the Repetier host.
+    name = re.sub(r"[^A-Za-z0-9._\-]", "_", name).lstrip(".") or "upload.gcode"
+    if not name.lower().endswith((".gcode", ".gco", ".g")):
+        name += ".gcode"
     if name != original:
         log.info("renamed %s -> %s", original, name)
     log.info("upload %s (%d bytes) slug=%s print=%s", name, len(content), slug, start)
@@ -558,12 +685,21 @@ for route, handler, methods in ROUTES:
 
 
 @app.get("/")
-async def root():
+async def root(x_api_key: Optional[str] = Header(None)):
+    """Unauthenticated callers get a bare liveness response. Configuration is
+    only shown to a caller that already holds a valid token -- this endpoint
+    used to list the token names to anyone who asked."""
+    try:
+        check_key(x_api_key)
+    except HTTPException:
+        return {"service": "repetier-octoprint-bridge", "status": "ok"}
+
     return {
         "service": "repetier-octoprint-bridge",
+        "status": "ok",
         "repetier": REPETIER_URL,
         "default_slug": DEFAULT_SLUG or None,
-        "mapped_keys": list(KEY_MAP),
+        "printers": sorted(set(KEY_MAP.values())),
         "hint": "Point EasyPrint at this host as an OctoPrint instance.",
     }
 
@@ -572,14 +708,38 @@ async def root():
 async def catch_all(full_path: str, request: Request):
     """Log anything EasyPrint asks for that isn't implemented yet."""
     body = (await request.body())[:500]
+    safe_headers = {
+        k: ("<redacted>" if k.lower() in REDACT_HEADERS else v)
+        for k, v in request.headers.items()
+    }
     log.warning(
         "UNHANDLED %s /%s\n  headers=%s\n  body=%s",
         request.method,
         full_path,
-        dict(request.headers),
+        safe_headers,
         body,
     )
     return JSONResponse({"error": "Not implemented in bridge", "path": full_path}, status_code=404)
+
+
+def warn_if_open():
+    if not REQUIRE_KEY and not KEY_MAP:
+        log.warning(
+            "NO AUTHENTICATION CONFIGURED: every request is accepted. Set "
+            "BRIDGE_KEYMAP before exposing this beyond a trusted LAN."
+        )
+    weak = [k for k in KEY_MAP if len(k) < 20]
+    if weak:
+        log.warning(
+            "%d token(s) shorter than 20 characters. Generate stronger ones "
+            "with: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'",
+            len(weak),
+        )
+
+
+# Called at import rather than via on_event("startup"), which FastAPI has
+# deprecated -- this way it runs under both `uvicorn module:app` and __main__.
+warn_if_open()
 
 
 if __name__ == "__main__":
